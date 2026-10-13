@@ -115,7 +115,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   if (!key) throw new Error("MISSING_GEMINI_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
-  const model = String(process.env.OPENROUTER_MODEL || "google/gemma-4-26b-a4b-it:free").trim();
+ const model = String(process.env.OPENROUTER_MODEL || "meta-llama/llama-3.3-70b-instruct:free").trim();
 
   const messages = [
     { role: "system", content: SYSTEM_PROMPT }
