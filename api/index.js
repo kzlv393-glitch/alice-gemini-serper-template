@@ -111,38 +111,44 @@ async function searchWeb(query, timeoutMs) {
 }
 
 async function askGemini(text, history, searchContext, timeoutMs) {
-  const key = process.env.GEMINI_API_KEY;
+  const key = process.env.OPENROUTER_API_KEY;
   if (!key) throw new Error("MISSING_GEMINI_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
-  const model = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
-  if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
+  const model = String(process.env.OPENROUTER_MODEL || "google/gemma-4-26b-a4b-it:free").trim();
 
-  const contents = safeHistory(history).map(item => ({
-    role: item.role,
-    parts: [{ text: item.text }]
-  }));
+  const messages = [
+    { role: "system", content: SYSTEM_PROMPT }
+  ];
+
+  for (const item of safeHistory(history)) {
+    messages.push({
+      role: item.role === "model" ? "assistant" : "user",
+      content: item.text
+    });
+  }
 
   const prompt = searchContext
     ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
     : text;
-  contents.push({ role: "user", parts: [{ text: prompt }] });
+
+  messages.push({ role: "user", content: prompt });
 
   const { response, data } = await fetchJson(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+    "https://openrouter.ai/api/v1/chat/completions",
     {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-goog-api-key": key
+        "Authorization": `Bearer ${key}`,
+        "HTTP-Referer": "https://alice-gemini-serper-template.vercel.app",
+        "X-Title": "Alice Gemini Skill"
       },
       body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        contents,
-        generationConfig: {
-          temperature: 0.5,
-          maxOutputTokens: 240
-        }
+        model: model,
+        messages: messages,
+        temperature: 0.5,
+        max_tokens: 240
       })
     },
     Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
@@ -150,25 +156,26 @@ async function askGemini(text, history, searchContext, timeoutMs) {
 
   if (!response.ok) {
     const status = Number(response.status);
-    console.error("Gemini request failed with HTTP", status);
+    console.error("OpenRouter request failed with HTTP", status);
     if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
     if (status === 429) throw new Error("GEMINI_QUOTA");
     throw new Error("GEMINI_REQUEST_FAILED");
   }
 
-  const candidate = data?.candidates?.[0];
-  const answer = (candidate?.content?.parts || [])
-    .map(part => typeof part.text === "string" ? part.text : "")
-    .join("")
-    .trim();
+  const candidate = data?.choices?.[0];
+  const answer = (candidate?.message?.content || "").trim();
 
   if (!answer) {
-    if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
+    if (data?.error?.message) {
+      console.warn("OpenRouter error:", data.error.message);
+    }
     throw new Error("GEMINI_EMPTY_RESPONSE");
   }
-  if (candidate?.finishReason === "MAX_TOKENS") {
-    console.warn("Gemini reached the output token limit.");
+
+  if (candidate?.finish_reason === "length") {
+    console.warn("OpenRouter reached the output token limit.");
   }
+
   return answer;
 }
 
