@@ -1,16 +1,16 @@
-const DEFAULT_MODEL = "gemini-3.5-flash-lite";
+const DEFAULT_MODEL = "gemini-1.5-flash"; 
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 3600;
+const TOTAL_RESPONSE_BUDGET_MS = 3600; // Лимит времени, чтобы успеть до 4.5 сек Алисы
 const SERPER_TIMEOUT_MS = 600;
-const GEMINI_TIMEOUT_MS = 2500;
+const GEMINI_TIMEOUT_MS = 2500; // Жесткий лимит на ответ от Gemini
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
   "Отвечай естественно, по-русски, кратко и так, чтобы ответ было удобно слушать.",
-  "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
-  "Если вопрос требует актуальных данных и переданы результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
+  "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные перечисления.",
+  "Если вопрос требует актуальных данных и переданы результаты поиска, опирайся на них; не выдумывай отсутствующую информацию.",
   "Если не знаешь ответа, честно скажи об этом."
 ].join(" ");
 
@@ -46,7 +46,7 @@ function fitAliceText(value) {
 }
 
 function isSearchIntent(text) {
-  return /\b(latest|today|current|news|weather|price|exchange rate|recent|search|look up)\b|сегодня|сейчас|последн|новост|погод|курс валют|найди|поищи|актуальн|сколько стоит|свежие данные/i.test(text);
+  return /\b(latest|today|current|news|weather|price|exchange rate|recent|search|look up)\b|сегодня|сейчас|последн|новост|погод|курс|валют|найд|поищ|актуальн|сколько стоит|свежие данные/i.test(text);
 }
 
 function safeHistory(history) {
@@ -111,72 +111,77 @@ async function searchWeb(query, timeoutMs) {
 }
 
 async function askGemini(text, history, searchContext, timeoutMs) {
-  const key = process.env.OPENROUTER_API_KEY;
+  const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("MISSING_GEMINI_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
- const model = String(process.env.OPENROUTER_MODEL || "meta-llama/llama-3.3-70b-instruct:free").trim();
-
-  const messages = [
-    { role: "system", content: SYSTEM_PROMPT }
-  ];
-
-  for (const item of safeHistory(history)) {
-    messages.push({
-      role: item.role === "model" ? "assistant" : "user",
-      content: item.text
-    });
-  }
+  const modelName = process.env.GEMINI_MODEL || DEFAULT_MODEL;
+  
+  // Формируем историю для Gemini
+  const contents = safeHistory(history).map(item => ({
+    role: item.role === "model" ? "model" : "user",
+    parts: [{ text: item.text }]
+  }));
 
   const prompt = searchContext
     ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
     : text;
 
-  messages.push({ role: "user", content: prompt });
+  contents.push({ role: "user", parts: [{ text: prompt }] });
 
-  const { response, data } = await fetchJson(
-    "https://openrouter.ai/api/v1/chat/completions",
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${key}`,
-        "HTTP-Referer": "https://alice-gemini-serper-template.vercel.app",
-        "X-Title": "Alice Gemini Skill"
-      },
-      body: JSON.stringify({
-        model: model,
-        messages: messages,
-        temperature: 0.5,
-        max_tokens: 240
-      })
-    },
-    Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${key}`;
+  
+  const body = {
+    systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+    contents: contents,
+    generationConfig: {
+      temperature: 0.5,
+      maxOutputTokens: 240
+    }
+  };
+
+  const timeoutPromise = new Promise((_, reject) => 
+    setTimeout(() => reject(new Error("GEMINI_TIMEOUT")), Math.min(GEMINI_TIMEOUT_MS, timeoutMs))
   );
 
-  if (!response.ok) {
-    const status = Number(response.status);
-    console.error("OpenRouter request failed with HTTP", status);
-    if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
-    if (status === 429) throw new Error("GEMINI_QUOTA");
-    throw new Error("GEMINI_REQUEST_FAILED");
-  }
+  try {
+    const fetchPromise = fetchJson(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    }, Math.min(GEMINI_TIMEOUT_MS, timeoutMs));
 
-  const candidate = data?.choices?.[0];
-  const answer = (candidate?.message?.content || "").trim();
+    const { response, data } = await Promise.race([fetchPromise, timeoutPromise]);
 
-  if (!answer) {
-    if (data?.error?.message) {
-      console.warn("OpenRouter error:", data.error.message);
+    if (!response.ok) {
+      const status = Number(response.status);
+      console.error("Gemini request failed with HTTP", status);
+      if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
+      if (status === 429) throw new Error("GEMINI_QUOTA");
+      throw new Error("GEMINI_REQUEST_FAILED");
     }
-    throw new Error("GEMINI_EMPTY_RESPONSE");
-  }
 
-  if (candidate?.finish_reason === "length") {
-    console.warn("OpenRouter reached the output token limit.");
-  }
+    const candidate = data?.candidates?.[0];
+    const answer = (candidate?.content?.parts || [])
+      .map(part => typeof part.text === "string" ? part.text : "")
+      .join("")
+      .trim();
 
-  return answer;
+    if (!answer) {
+      if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
+      throw new Error("GEMINI_EMPTY_RESPONSE");
+    }
+
+    return answer;
+  } catch (error) {
+    if (error.message === "GEMINI_TIMEOUT") {
+      throw new Error("GEMINI_QUOTA"); 
+    }
+    if (error.message === "AbortError") {
+      throw new Error("TIME_BUDGET_EXHAUSTED");
+    }
+    throw error;
+  }
 }
 
 function errorForUser(error) {
@@ -186,11 +191,11 @@ function errorForUser(error) {
     case "GEMINI_KEY_REJECTED":
       return "Не удалось подключиться к Gemini. Проверьте API-ключ в настройках Vercel.";
     case "GEMINI_QUOTA":
+    case "GEMINI_TIMEOUT":
       return "Сейчас превышен лимит запросов к Gemini. Попробуйте немного позже.";
     case "GEMINI_BLOCKED":
       return "Я не смогла обработать этот запрос. Попробуйте спросить иначе.";
     case "TIME_BUDGET_EXHAUSTED":
-    case "AbortError":
       return "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";
     default:
       return "Не получилось получить ответ от нейросети. Попробуйте ещё раз чуть позже.";
@@ -228,7 +233,6 @@ export default async function handler(req, res) {
   try {
     let searchContext = "";
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
-      // Search has a very short budget because Alice expects a response within 4.5 seconds.
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
     }
 
@@ -252,5 +256,3 @@ export default async function handler(req, res) {
     return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
   }
 }
-
-export { aliceResponse, fitAliceText, isSearchIntent, safeHistory };
